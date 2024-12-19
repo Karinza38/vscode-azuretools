@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { SubscriptionClient, TenantIdDescription } from '@azure/arm-resources-subscriptions'; // Keep this as `import type` to avoid actually loading the package before necessary
+import type { SubscriptionClient } from '@azure/arm-resources-subscriptions'; // Keep this as `import type` to avoid actually loading the package before necessary
 import type { TokenCredential } from '@azure/core-auth'; // Keep this as `import type` to avoid actually loading the package (at all, this one is dev-only)
 import * as vscode from 'vscode';
 import { AzureAuthentication } from './AzureAuthentication';
@@ -12,6 +12,7 @@ import { AzureSubscriptionProvider } from './AzureSubscriptionProvider';
 import { getSessionFromVSCode } from './getSessionFromVSCode';
 import { NotSignedInError } from './NotSignedInError';
 import { getConfiguredAuthProviderId, getConfiguredAzureEnv } from './utils/configuredAzureEnv';
+import { AzureTenant } from './AzureTenant';
 
 const EventDebounce = 5 * 1000; // 5 seconds
 
@@ -27,7 +28,8 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
     private readonly onDidSignOutEmitter = new vscode.EventEmitter<void>();
     private lastSignOutEventFired: number = 0;
 
-    public constructor() {
+    // So that customers can easily share logs, try to only log PII using trace level
+    public constructor(private readonly logger?: vscode.LogOutputChannel) {
         const disposable = vscode.authentication.onDidChangeSessions(async e => {
             // Ignore any sign in that isn't for the configured auth provider
             if (e.provider.id !== getConfiguredAuthProviderId()) {
@@ -60,9 +62,9 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
      *
      * @returns A list of tenants.
      */
-    public async getTenants(account?: vscode.AuthenticationSessionAccountInformation): Promise<TenantIdDescription[]> {
-        const results: TenantIdDescription[] = [];
-
+    public async getTenants(account?: vscode.AuthenticationSessionAccountInformation): Promise<AzureTenant[]> {
+        const startTimeMs = Date.now();
+        const results: AzureTenant[] = [];
         for await (account of account ? [account] : await vscode.authentication.getAccounts(getConfiguredAuthProviderId())) {
             // Added check. Without this the getSubscriptionClient function throws the NotSignedInError
             if (await this.isSignedIn(undefined, account)) {
@@ -70,11 +72,12 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
                 const { client } = await this.getSubscriptionClient(account, undefined, undefined);
 
                 for await (const tenant of client.tenants.list()) {
-                    results.push(tenant);
+                    results.push({ ...tenant, account });
                 }
             }
         }
-
+        const endTimeMs = Date.now();
+        this.logger?.debug(`auth: Got ${results.length} tenants for account "${account?.label}" in ${endTimeMs - startTimeMs}ms`);
         return results;
     }
 
@@ -92,16 +95,19 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
      * the user is signed in.
      */
     public async getSubscriptions(filter: boolean = true): Promise<AzureSubscription[]> {
+        this.logger?.debug('auth: Loading subscriptions...');
+        const startTime = Date.now();
         const tenantIds = await this.getTenantFilters();
         const shouldFilterTenants = filter && !!tenantIds.length; // If the list is empty it is treated as "no filter"
 
         const allSubscriptions: AzureSubscription[] = [];
-
+        let accountCount: number; // only used for logging
         try {
             this.suppressSignInEvents = true;
 
             // Get the list of tenants from each account
             const accounts = await vscode.authentication.getAccounts(getConfiguredAuthProviderId());
+            accountCount = accounts.length;
             for (const account of accounts) {
                 for (const tenant of await this.getTenants(account)) {
                     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -117,7 +123,7 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
                 }
 
                 // list subscriptions for the home tenant
-                allSubscriptions.push(...await this.getSubscriptionsForTenant(account))
+                allSubscriptions.push(...await this.getSubscriptionsForTenant(account));
             }
         } finally {
             this.suppressSignInEvents = false;
@@ -128,6 +134,9 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
         const subscriptionMap = new Map<string, AzureSubscription>();
         allSubscriptions.forEach(sub => subscriptionMap.set(`${sub.account.id}/${sub.subscriptionId}`, sub));
         const uniqueSubscriptions = Array.from(subscriptionMap.values());
+
+        const endTime = Date.now();
+        this.logger?.debug(`auth: Got ${uniqueSubscriptions.length} subscriptions from ${accountCount} accounts in ${endTime - startTime}ms`);
 
         const sortSubscriptions = (subscriptions: AzureSubscription[]): AzureSubscription[] =>
             subscriptions.sort((a, b) => a.name.localeCompare(b.name));
@@ -154,23 +163,31 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
      * checks all accounts for a session.
      */
     public async isSignedIn(tenantId?: string, account?: vscode.AuthenticationSessionAccountInformation): Promise<boolean> {
+        async function silentlyCheckForSession(tenantId?: string, account?: vscode.AuthenticationSessionAccountInformation): Promise<boolean> {
+            return !!await getSessionFromVSCode([], tenantId, { createIfNone: false, silent: true, account });
+        }
+        const innerIsSignedIn = async () => {
+            // If no tenant or account is provided, then check all accounts for a session
+            if (!account && !tenantId) {
+                const accounts = await vscode.authentication.getAccounts(getConfiguredAuthProviderId());
+                if (accounts.length === 0) {
+                    return false;
+                }
 
-        // If no tenant or account is provided, then check all accounts for a session
-        if (!account && !tenantId) {
-            const accounts = await vscode.authentication.getAccounts(getConfiguredAuthProviderId());
-            if (accounts.length === 0) {
-                return false;
-            }
-
-            for (const account of accounts) {
-                if (await this.isSignedIn(undefined, account)) {
-                    return true;
+                for (const account of accounts) {
+                    if (await silentlyCheckForSession(tenantId, account)) {
+                        // If any account has a session, then return true because the user is signed in
+                        return true;
+                    }
                 }
             }
+
+            return silentlyCheckForSession(tenantId, account);
         }
 
-        const session = await getSessionFromVSCode([], tenantId, { createIfNone: false, silent: true, account });
-        return !!session;
+        const result = await innerIsSignedIn();
+        this.logger?.trace(`auth: isSignedIn returned ${result} (account="${account?.label ?? 'none'}") (tenantId="${tenantId ?? 'none'}")`);
+        return result;
     }
 
     /**
@@ -182,7 +199,7 @@ export class VSCodeAzureSubscriptionProvider extends vscode.Disposable implement
      * @returns True if the user is signed in, false otherwise.
      */
     public async signIn(tenantId?: string, account?: vscode.AuthenticationSessionAccountInformation): Promise<boolean> {
-
+        this.logger?.debug(`auth: Signing in (account="${account?.label ?? 'none'}") (tenantId="${tenantId ?? 'none'}")`);
         const session = await getSessionFromVSCode([], tenantId, {
             createIfNone: true,
             // If no account is provided, then clear the session preference which tells VS Code to show the account picker
